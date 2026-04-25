@@ -1,0 +1,7 @@
+apscheduler
+customtkinter
+fastapi
+jinja2
+python-multipart
+telethon
+uvicorn

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}TG Poster{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') }}">
+</head>
+<body>
+    <div class="page-shell">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">Telegram Automation</p>
+                <h1>TG Poster</h1>
+            </div>
+            <div class="status-card">
+                <span class="status-label">Статус</span>
+                <strong>{{ status }}</strong>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <a href="/ads" class="{% if request.url.path == '/ads' %}active{% endif %}">Объявления</a>
+            <a href="/targets" class="{% if request.url.path == '/targets' %}active{% endif %}">Цели</a>
+            <a href="/logs" class="{% if request.url.path == '/logs' %}active{% endif %}">Логи</a>
+        </nav>
+
+        {% if message %}
+        <div class="flash success">{{ message }}</div>
+        {% endif %}
+        {% if error %}
+        <div class="flash error">{{ error }}</div>
+        {% endif %}
+
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>

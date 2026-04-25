@@ -22,12 +22,20 @@ class TelegramService:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
         self._thread = threading.Thread(
             target=self._run_background_loop,
             name="telegram-worker",
             daemon=True,
         )
         self._thread.start()
+
+    def stop(self) -> None:
+        if not self._loop:
+            return
+        future = asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
+        future.result(timeout=10)
 
     def get_status(self) -> str:
         return self.status
@@ -89,6 +97,20 @@ class TelegramService:
         except Exception as exc:
             self.status = f"Ошибка запуска: {exc}"
             self.logger.exception("Ошибка запуска Telegram: %s", exc)
+
+    async def _async_stop(self) -> None:
+        try:
+            if self._scheduler:
+                self._scheduler.shutdown(wait=False)
+                self._scheduler = None
+
+            if self._client:
+                await self._client.disconnect()
+                self._client = None
+        finally:
+            self.status = "Остановлено"
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon(self._loop.stop)
 
     async def _reload_scheduler(self) -> None:
         if not self._scheduler:

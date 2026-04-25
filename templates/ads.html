@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Объявления | TG Poster{% endblock %}
+{% block content %}
+<section class="layout two-column">
+    <div class="panel list-panel">
+        <div class="panel-header">
+            <h2>Объявления</h2>
+            <a class="ghost-button" href="/ads">Новое объявление</a>
+        </div>
+        <div class="list-stack">
+            {% for ad in ads %}
+            <a class="list-card {% if selected_ad_id == ad['id'] %}selected{% endif %}" href="/ads?ad_id={{ ad['id'] }}">
+                <strong>{{ ad["title"] }}</strong>
+                <span>{{ "ВКЛ" if ad["is_active"] else "ВЫКЛ" }} • каждые {{ ad["interval_days"] }} дн.</span>
+                <span>{{ ad["schedule_count"] }} врем. • {{ ad["target_count"] }} целей</span>
+            </a>
+            {% else %}
+            <div class="empty-state">Объявлений пока нет.</div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="panel form-panel">
+        <div class="panel-header">
+            <h2>{% if selected_ad %}Редактирование объявления{% else %}Новое объявление{% endif %}</h2>
+        </div>
+        <form method="post" action="/ads/save" enctype="multipart/form-data" class="form-grid">
+            {% if selected_ad %}
+            <input type="hidden" name="ad_id" value="{{ selected_ad['id'] }}">
+            {% endif %}
+
+            <label>
+                <span>Заголовок</span>
+                <input type="text" name="title" value="{{ selected_ad['title'] if selected_ad else '' }}" required>
+            </label>
+
+            <label class="full-width">
+                <span>Текст</span>
+                <textarea name="text" rows="8" required>{{ selected_ad['text'] if selected_ad else '' }}</textarea>
+            </label>
+
+            <label>
+                <span>Время публикации</span>
+                <input type="text" name="times" value="{{ selected_ad['times'] | join(', ') if selected_ad else '' }}" placeholder="09:00, 14:00, 20:00" required>
+            </label>
+
+            <label>
+                <span>Интервал в днях</span>
+                <input type="number" min="1" name="interval_days" value="{{ selected_ad['interval_days'] if selected_ad else 1 }}" required>
+            </label>
+
+            <label class="checkbox full-width">
+                <input type="checkbox" name="is_active" {% if not selected_ad or selected_ad['is_active'] %}checked{% endif %}>
+                <span>Объявление активно</span>
+            </label>
+
+            <label class="full-width">
+                <span>Текущие медиафайлы</span>
+                <textarea name="existing_media" rows="5" placeholder="Оставьте пустым, если медиа не нужны">{% if selected_ad %}{{ selected_ad['media_paths'] | join('\n') }}{% endif %}</textarea>
+            </label>
+
+            <label class="full-width">
+                <span>Загрузить новые медиафайлы</span>
+                <input type="file" name="media_files" multiple>
+            </label>
+
+            <fieldset class="full-width selection-box">
+                <legend>Чаты для публикации</legend>
+                <div class="checkbox-grid">
+                    {% for target in targets %}
+                    <label class="checkbox">
+                        <input type="checkbox" name="target_ids" value="{{ target['id'] }}" {% if selected_ad and target['id'] in selected_ad['target_ids'] %}checked{% endif %}>
+                        <span>[{{ "ВКЛ" if target["is_active"] else "ВЫКЛ" }}] {{ target["name"] }} -> {{ target["chat_ref"] }}</span>
+                    </label>
+                    {% else %}
+                    <div class="empty-state">Сначала добавьте хотя бы одну цель на вкладке "Цели".</div>
+                    {% endfor %}
+                </div>
+            </fieldset>
+
+            <div class="actions full-width">
+                <button type="submit">Сохранить</button>
+            </div>
+        </form>
+
+        {% if selected_ad %}
+        <div class="action-row">
+            <form method="post" action="/ads/{{ selected_ad['id'] }}/publish">
+                <button type="submit" class="secondary">Опубликовать сейчас</button>
+            </form>
+            <form method="post" action="/scheduler/reload">
+                <input type="hidden" name="ad_id" value="{{ selected_ad['id'] }}">
+                <button type="submit" class="secondary">Перезагрузить расписание</button>
+            </form>
+            <form method="post" action="/ads/{{ selected_ad['id'] }}/delete" onsubmit="return confirm('Удалить выбранное объявление?');">
+                <button type="submit" class="danger">Удалить объявление</button>
+            </form>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}

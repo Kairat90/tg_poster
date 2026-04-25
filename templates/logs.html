@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Логи | TG Poster{% endblock %}
+{% block content %}
+<section class="panel">
+    <div class="panel-header">
+        <h2>Логи публикаций</h2>
+        <a class="ghost-button" href="/logs">Обновить</a>
+    </div>
+    <div class="log-table-wrapper">
+        <table class="log-table">
+            <thead>
+                <tr>
+                    <th>Время</th>
+                    <th>Статус</th>
+                    <th>Объявление</th>
+                    <th>Цель</th>
+                    <th>Сообщение</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in logs %}
+                <tr>
+                    <td>{{ row["published_at"] }}</td>
+                    <td>{{ row["status"] }}</td>
+                    <td>{{ row["ad_title"] }}</td>
+                    <td>{{ row["target_name"] or row["target_chat_ref"] or "неизвестная цель" }}</td>
+                    <td>{{ row["message"] }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5" class="empty-state">Логов пока нет.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}
