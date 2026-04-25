@@ -19,6 +19,7 @@ ENV_PATH = BASE_DIR / ".env"
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 UPLOAD_TMP_DIR = BASE_DIR / "_uploads"
+FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
 
 
 def load_env_file(path: Path) -> None:
@@ -53,6 +54,7 @@ class Settings:
     templates_dir: Path = TEMPLATES_DIR
     static_dir: Path = STATIC_DIR
     upload_tmp_dir: Path = UPLOAD_TMP_DIR
+    frontend_dist_dir: Path = FRONTEND_DIST_DIR
 
     @property
     def telegram_ready(self) -> bool:

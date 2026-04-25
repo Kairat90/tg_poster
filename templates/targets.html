@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% block title %}Цели | TG Poster{% endblock %}
+{% block title %}Каналы | TG Poster{% endblock %}
 {% block content %}
 <section class="layout two-column">
     <div class="panel list-panel">
         <div class="panel-header">
-            <h2>Цели</h2>
-            <a class="ghost-button" href="/targets">Новая цель</a>
+            <h2>Каналы</h2>
+            <a class="ghost-button" href="/targets">Новый канал</a>
         </div>
         <div class="list-stack">
             {% for target in targets %}
@@ -13,16 +13,19 @@
                 <strong>{{ target["name"] }}</strong>
                 <span>{{ "ВКЛ" if target["is_active"] else "ВЫКЛ" }}</span>
                 <span>{{ target["chat_ref"] }}</span>
+                {% if target["topic_title"] %}
+                <span>Тема: {{ target["topic_title"] }}</span>
+                {% endif %}
             </a>
             {% else %}
-            <div class="empty-state">Целей пока нет.</div>
+            <div class="empty-state">Каналов пока нет.</div>
             {% endfor %}
         </div>
     </div>
 
     <div class="panel form-panel">
         <div class="panel-header">
-            <h2>{% if selected_target %}Редактирование цели{% else %}Новая цель{% endif %}</h2>
+            <h2>{% if selected_target %}Редактирование канала{% else %}Новый канал{% endif %}</h2>
         </div>
         <form method="post" action="/targets/save" class="form-grid">
             {% if selected_target %}
@@ -39,20 +42,30 @@
                 <input type="text" name="chat_ref" value="{{ selected_target['chat_ref'] if selected_target else '' }}" placeholder="@channel или https://t.me/..." required>
             </label>
 
+            <label>
+                <span>ID темы</span>
+                <input type="number" name="topic_id" value="{{ selected_target['topic_id'] if selected_target and selected_target['topic_id'] else '' }}" placeholder="Например, 421482">
+            </label>
+
+            <label>
+                <span>Название темы</span>
+                <input type="text" name="topic_title" value="{{ selected_target['topic_title'] if selected_target and selected_target['topic_title'] else '' }}" placeholder="Например, Электроника">
+            </label>
+
             <label class="checkbox full-width">
                 <input type="checkbox" name="is_active" {% if not selected_target or selected_target['is_active'] %}checked{% endif %}>
-                <span>Цель активна</span>
+                <span>Канал активен</span>
             </label>
 
             <div class="actions full-width">
-                <button type="submit">Сохранить цель</button>
+                <button type="submit">Сохранить канал</button>
             </div>
         </form>
 
         {% if selected_target %}
         <div class="action-row">
-            <form method="post" action="/targets/{{ selected_target['id'] }}/delete" onsubmit="return confirm('Удалить выбранную цель?');">
-                <button type="submit" class="danger">Удалить цель</button>
+            <form method="post" action="/targets/{{ selected_target['id'] }}/delete" onsubmit="return confirm('Удалить выбранный канал?');">
+                <button type="submit" class="danger">Удалить канал</button>
             </form>
         </div>
         {% endif %}

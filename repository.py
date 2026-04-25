@@ -25,6 +25,8 @@ class Repository:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     chat_ref TEXT NOT NULL UNIQUE,
+                    topic_id INTEGER,
+                    topic_title TEXT,
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -76,13 +78,24 @@ class Repository:
                 );
                 """
             )
+            self._ensure_targets_columns(conn)
             conn.commit()
+
+    def _ensure_targets_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(targets)").fetchall()
+        }
+        if "topic_id" not in columns:
+            conn.execute("ALTER TABLE targets ADD COLUMN topic_id INTEGER")
+        if "topic_title" not in columns:
+            conn.execute("ALTER TABLE targets ADD COLUMN topic_title TEXT")
 
     def list_targets(self) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
             return conn.execute(
                 """
-                SELECT id, name, chat_ref, is_active, created_at, updated_at
+                SELECT id, name, chat_ref, topic_id, topic_title, is_active, created_at, updated_at
                 FROM targets
                 ORDER BY name COLLATE NOCASE, id
                 """
@@ -100,6 +113,8 @@ class Repository:
         target_id: int | None,
         name: str,
         chat_ref: str,
+        topic_id: int | None,
+        topic_title: str,
         is_active: bool,
     ) -> int:
         now = datetime.now().isoformat(timespec="seconds")
@@ -107,10 +122,10 @@ class Repository:
             if target_id is None:
                 cursor = conn.execute(
                     """
-                    INSERT INTO targets (name, chat_ref, is_active, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO targets (name, chat_ref, topic_id, topic_title, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (name, chat_ref, int(is_active), now, now),
+                    (name, chat_ref, topic_id, topic_title, int(is_active), now, now),
                 )
                 conn.commit()
                 return int(cursor.lastrowid)
@@ -118,10 +133,10 @@ class Repository:
             conn.execute(
                 """
                 UPDATE targets
-                SET name = ?, chat_ref = ?, is_active = ?, updated_at = ?
+                SET name = ?, chat_ref = ?, topic_id = ?, topic_title = ?, is_active = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (name, chat_ref, int(is_active), now, target_id),
+                (name, chat_ref, topic_id, topic_title, int(is_active), now, target_id),
             )
             conn.commit()
             return target_id
@@ -170,7 +185,7 @@ class Repository:
             ).fetchall()
             target_rows = conn.execute(
                 """
-                SELECT t.id, t.name, t.chat_ref
+                SELECT t.id, t.name, t.chat_ref, t.topic_id, t.topic_title
                 FROM ad_targets at
                 JOIN targets t ON t.id = at.target_id
                 WHERE at.ad_id = ?
@@ -308,7 +323,7 @@ class Repository:
             ).fetchall()
             targets = conn.execute(
                 """
-                SELECT t.id, t.name, t.chat_ref
+                SELECT t.id, t.name, t.chat_ref, t.topic_id, t.topic_title
                 FROM ad_targets at
                 JOIN targets t ON t.id = at.target_id
                 WHERE at.ad_id = ? AND t.is_active = 1

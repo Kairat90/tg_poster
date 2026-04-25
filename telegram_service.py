@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import random
+import sqlite3
 import threading
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 
 
 class TelegramService:
@@ -53,6 +54,12 @@ class TelegramService:
             self._loop,
         )
 
+    def list_forum_topics(self, chat_ref: str) -> list[dict]:
+        if not self._loop:
+            raise RuntimeError("Фоновый процесс Telegram еще не запущен.")
+        future = asyncio.run_coroutine_threadsafe(self._list_forum_topics(chat_ref), self._loop)
+        return future.result(timeout=20)
+
     def _run_background_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -95,6 +102,13 @@ class TelegramService:
             self.status = "Расписание запущено"
             self.logger.info("Планировщик запущен.")
         except Exception as exc:
+            if self._is_session_locked_error(exc):
+                self.status = "Сессия Telegram занята другим экземпляром приложения"
+                self.logger.error(
+                    "Сессия Telegram заблокирована другим процессом. "
+                    "Закройте другие экземпляры tg_poster.exe / python, которые используют тот же my_account.session."
+                )
+                return
             self.status = f"Ошибка запуска: {exc}"
             self.logger.exception("Ошибка запуска Telegram: %s", exc)
 
@@ -169,38 +183,91 @@ class TelegramService:
 
         for target in payload["targets"]:
             try:
+                topic_id = target.get("topic_id")
                 if len(media_files) > 1:
                     await self._client.send_file(
                         target["chat_ref"],
                         media_files,
                         caption=payload["text"],
+                        reply_to=topic_id,
                     )
                 elif len(media_files) == 1:
                     await self._client.send_file(
                         target["chat_ref"],
                         media_files[0],
                         caption=payload["text"],
+                        reply_to=topic_id,
                     )
                 else:
-                    await self._client.send_message(target["chat_ref"], payload["text"])
+                    await self._client.send_message(
+                        target["chat_ref"],
+                        payload["text"],
+                        reply_to=topic_id,
+                    )
+
+                destination_label = target["chat_ref"]
+                if topic_id and target.get("topic_title"):
+                    destination_label = f"{destination_label} -> {target['topic_title']}"
+                elif topic_id:
+                    destination_label = f"{destination_label} -> topic {topic_id}"
 
                 self.repository.add_publish_log(
                     ad_id,
                     target["id"],
                     "успех",
-                    f"Опубликовано в {target['chat_ref']}",
+                    f"Опубликовано в {destination_label}",
                 )
-                self.logger.info("Объявление %s опубликовано в %s.", ad_id, target["chat_ref"])
+                self.logger.info("Объявление %s опубликовано в %s.", ad_id, destination_label)
 
                 pause_seconds = random.randint(30, 60)
                 await asyncio.sleep(pause_seconds)
             except Exception as exc:
-                error_message = f"Не удалось опубликовать в {target['chat_ref']}: {exc}"
+                destination_label = target["chat_ref"]
+                if target.get("topic_title"):
+                    destination_label = f"{destination_label} -> {target['topic_title']}"
+                elif target.get("topic_id"):
+                    destination_label = f"{destination_label} -> topic {target['topic_id']}"
+                error_message = f"Не удалось опубликовать в {destination_label}: {exc}"
                 self.repository.add_publish_log(ad_id, target["id"], "ошибка", error_message)
                 self.logger.exception(error_message)
+
+    async def _list_forum_topics(self, chat_ref: str) -> list[dict]:
+        if not self._client:
+            raise RuntimeError("Клиент Telegram не готов.")
+
+        result = await self._client(
+            functions.messages.GetForumTopicsRequest(
+                peer=chat_ref,
+                offset_date=None,
+                offset_id=0,
+                offset_topic=0,
+                limit=100,
+            )
+        )
+
+        topics: list[dict] = []
+        for topic in result.topics:
+            title = getattr(topic, "title", None)
+            if not title:
+                continue
+            topics.append({"id": topic.id, "title": title})
+
+        return topics
 
     def _resolve_media_path(self, relative_path: str) -> Path:
         media_path = Path(relative_path)
         if not media_path.is_absolute():
             media_path = self.settings.base_dir / media_path
         return media_path
+
+    def _is_session_locked_error(self, exc: Exception) -> bool:
+        if isinstance(exc, sqlite3.OperationalError):
+            return "database is locked" in str(exc).lower()
+
+        current = exc
+        while current:
+            if isinstance(current, sqlite3.OperationalError) and "database is locked" in str(current).lower():
+                return True
+            current = current.__cause__ or current.__context__
+
+        return False

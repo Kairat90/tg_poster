@@ -12,7 +12,7 @@
             <a class="list-card {% if selected_ad_id == ad['id'] %}selected{% endif %}" href="/ads?ad_id={{ ad['id'] }}">
                 <strong>{{ ad["title"] }}</strong>
                 <span>{{ "ВКЛ" if ad["is_active"] else "ВЫКЛ" }} • каждые {{ ad["interval_days"] }} дн.</span>
-                <span>{{ ad["schedule_count"] }} врем. • {{ ad["target_count"] }} целей</span>
+                <span>{{ ad["schedule_count"] }} врем. • {{ ad["target_count"] }} каналов</span>
             </a>
             {% else %}
             <div class="empty-state">Объявлений пока нет.</div>
@@ -65,15 +65,15 @@
             </label>
 
             <fieldset class="full-width selection-box">
-                <legend>Чаты для публикации</legend>
+                <legend>Каналы для публикации</legend>
                 <div class="checkbox-grid">
                     {% for target in targets %}
                     <label class="checkbox">
                         <input type="checkbox" name="target_ids" value="{{ target['id'] }}" {% if selected_ad and target['id'] in selected_ad['target_ids'] %}checked{% endif %}>
-                        <span>[{{ "ВКЛ" if target["is_active"] else "ВЫКЛ" }}] {{ target["name"] }} -> {{ target["chat_ref"] }}</span>
+                        <span>[{{ "ВКЛ" if target["is_active"] else "ВЫКЛ" }}] {{ target["name"] }} -> {{ target["chat_ref"] }}{% if target["topic_title"] %} | тема: {{ target["topic_title"] }}{% endif %}</span>
                     </label>
                     {% else %}
-                    <div class="empty-state">Сначала добавьте хотя бы одну цель на вкладке "Цели".</div>
+                    <div class="empty-state">Сначала добавьте хотя бы один канал на вкладке "Каналы".</div>
                     {% endfor %}
                 </div>
             </fieldset>

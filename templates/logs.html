@@ -13,7 +13,7 @@
                     <th>Время</th>
                     <th>Статус</th>
                     <th>Объявление</th>
-                    <th>Цель</th>
+                    <th>Канал</th>
                     <th>Сообщение</th>
                 </tr>
             </thead>
@@ -23,7 +23,7 @@
                     <td>{{ row["published_at"] }}</td>
                     <td>{{ row["status"] }}</td>
                     <td>{{ row["ad_title"] }}</td>
-                    <td>{{ row["target_name"] or row["target_chat_ref"] or "неизвестная цель" }}</td>
+                    <td>{{ row["target_name"] or row["target_chat_ref"] or "неизвестный канал" }}</td>
                     <td>{{ row["message"] }}</td>
                 </tr>
                 {% else %}
