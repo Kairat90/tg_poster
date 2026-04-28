@@ -46,6 +46,7 @@ class Settings:
     password: str
     web_host: str
     web_port: int
+    embedded_worker_enabled: bool
     base_dir: Path = BASE_DIR
     media_dir: Path = MEDIA_DIR
     db_path: Path = DB_PATH
@@ -68,6 +69,8 @@ def get_settings() -> Settings:
     api_id = int(api_id_raw) if api_id_raw.isdigit() else None
     web_port_raw = os.getenv("WEB_PORT", "8000").strip()
     web_port = int(web_port_raw) if web_port_raw.isdigit() else 8000
+    embedded_worker_raw = os.getenv("EMBEDDED_WORKER_ENABLED", "0").strip().lower()
+    embedded_worker_enabled = embedded_worker_raw in {"1", "true", "yes", "on"}
 
     return Settings(
         api_id=api_id,
@@ -76,4 +79,5 @@ def get_settings() -> Settings:
         password=os.getenv("TG_PASSWORD", "").strip(),
         web_host=os.getenv("WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
         web_port=web_port,
+        embedded_worker_enabled=embedded_worker_enabled,
     )

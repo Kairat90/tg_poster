@@ -21,6 +21,9 @@ class TelegramService:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler: AsyncIOScheduler | None = None
         self._thread: threading.Thread | None = None
+        self._job_loop_task: asyncio.Task | None = None
+        self._command_loop_task: asyncio.Task | None = None
+        self._running_lock = asyncio.Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -42,17 +45,20 @@ class TelegramService:
         return self.status
 
     def refresh_scheduler(self) -> None:
+        self.repository.enqueue_system_command("reload_scheduler")
         if not self._loop:
             return
-        asyncio.run_coroutine_threadsafe(self._reload_scheduler(), self._loop)
+        asyncio.run_coroutine_threadsafe(self._process_system_commands(), self._loop)
 
     def publish_now(self, ad_id: int) -> Future:
-        if not self._loop:
-            raise RuntimeError("Фоновый процесс Telegram еще не запущен.")
-        return asyncio.run_coroutine_threadsafe(
-            self._publish_ad(ad_id, manual=True),
-            self._loop,
-        )
+        slot_key = f"manual:{ad_id}:{datetime.now().isoformat(timespec='seconds')}"
+        self.repository.enqueue_publish_job(ad_id, "manual", slot_key)
+        if self._loop:
+            return asyncio.run_coroutine_threadsafe(self._process_publish_jobs(), self._loop)
+
+        future: Future = Future()
+        future.set_result(None)
+        return future
 
     def list_forum_topics(self, chat_ref: str) -> list[dict]:
         if not self._loop:
@@ -99,6 +105,8 @@ class TelegramService:
             self._scheduler = AsyncIOScheduler()
             await self._reload_scheduler()
             self._scheduler.start()
+            self._job_loop_task = self._loop.create_task(self._run_job_loop())
+            self._command_loop_task = self._loop.create_task(self._run_command_loop())
             self.status = "Расписание запущено"
             self.logger.info("Планировщик запущен.")
         except Exception as exc:
@@ -117,6 +125,12 @@ class TelegramService:
             if self._scheduler:
                 self._scheduler.shutdown(wait=False)
                 self._scheduler = None
+            if self._job_loop_task:
+                self._job_loop_task.cancel()
+                self._job_loop_task = None
+            if self._command_loop_task:
+                self._command_loop_task.cancel()
+                self._command_loop_task = None
 
             if self._client:
                 await self._client.disconnect()
@@ -136,13 +150,16 @@ class TelegramService:
         for row in self.repository.list_active_schedules():
             next_run = self._next_run_datetime(row["time_of_day"])
             self._scheduler.add_job(
-                self._publish_ad,
+                self._enqueue_scheduled_publish,
                 trigger="interval",
                 days=row["interval_days"],
                 start_date=next_run,
-                args=[row["ad_id"]],
+                args=[row["ad_id"], row["time_of_day"]],
                 id=f"ad-{row['ad_id']}-{row['time_of_day']}",
                 replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=300,
             )
 
         self.logger.info("Расписание обновлено, активных задач: %s.", len(self._scheduler.get_jobs()))
@@ -159,7 +176,63 @@ class TelegramService:
             candidate += timedelta(days=1)
         return candidate
 
-    async def _publish_ad(self, ad_id: int, manual: bool = False) -> None:
+    async def _enqueue_scheduled_publish(self, ad_id: int, time_of_day: str) -> None:
+        slot_key = f"schedule:{ad_id}:{time_of_day}:{datetime.now().strftime('%Y-%m-%d')}"
+        self.repository.enqueue_publish_job(ad_id, "schedule", slot_key)
+        await self._process_publish_jobs()
+
+    async def _run_job_loop(self) -> None:
+        while True:
+            try:
+                await self._process_publish_jobs()
+            except Exception as exc:
+                self.logger.exception("Ошибка обработки очереди публикаций: %s", exc)
+            await asyncio.sleep(2)
+
+    async def _run_command_loop(self) -> None:
+        while True:
+            try:
+                await self._process_system_commands()
+            except Exception as exc:
+                self.logger.exception("Ошибка обработки системных команд: %s", exc)
+            await asyncio.sleep(2)
+
+    async def _process_system_commands(self) -> None:
+        while True:
+            command = self.repository.acquire_next_system_command()
+            if not command:
+                return
+            try:
+                if command["command"] == "reload_scheduler":
+                    await self._reload_scheduler()
+            finally:
+                self.repository.complete_system_command(command["id"])
+
+    async def _process_publish_jobs(self) -> None:
+        if not self._client:
+            return
+
+        async with self._running_lock:
+            while True:
+                job = self.repository.acquire_next_publish_job()
+                if not job:
+                    return
+
+                try:
+                    await self._publish_ad(job["ad_id"], job["slot_key"], manual=(job["run_type"] == "manual"))
+                    self.repository.complete_publish_job(job["id"])
+                except Exception as exc:
+                    error_text = str(exc)
+                    should_retry = self.repository.should_retry_publish_job(job["id"])
+                    self.repository.fail_publish_job(job["id"], error_text, should_retry)
+                    self.logger.exception(
+                        "Публикация ad_id=%s (job_id=%s) завершилась ошибкой: %s",
+                        job["ad_id"],
+                        job["id"],
+                        exc,
+                    )
+
+    async def _publish_ad(self, ad_id: int, slot_key: str, manual: bool = False) -> None:
         if not self._client:
             self.logger.warning("Публикация объявления %s пропущена: клиент Telegram не готов.", ad_id)
             return
@@ -183,6 +256,15 @@ class TelegramService:
 
         for target in payload["targets"]:
             try:
+                if not self.repository.reserve_publish_slot(ad_id, target["id"], slot_key):
+                    self.logger.info(
+                        "Публикация ad_id=%s target_id=%s пропущена: слот %s уже обработан.",
+                        ad_id,
+                        target["id"],
+                        slot_key,
+                    )
+                    continue
+
                 topic_id = target.get("topic_id")
                 if len(media_files) > 1:
                     await self._client.send_file(

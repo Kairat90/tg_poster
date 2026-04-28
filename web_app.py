@@ -1,5 +1,7 @@
 import shutil
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from tempfile import NamedTemporaryFile
@@ -15,6 +17,33 @@ from config import get_settings
 from logger_config import configure_logging
 from repository import Repository
 from telegram_service import TelegramService
+
+
+class QueueOnlyTelegramService:
+    def __init__(self, repository) -> None:
+        self.repository = repository
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def get_status(self) -> str:
+        return "Worker отделен от web-процесса"
+
+    def refresh_scheduler(self) -> None:
+        self.repository.enqueue_system_command("reload_scheduler")
+
+    def publish_now(self, ad_id: int) -> Future:
+        slot_key = f"manual:{ad_id}:{datetime.now().isoformat(timespec='seconds')}"
+        self.repository.enqueue_publish_job(ad_id, "manual", slot_key)
+        future: Future = Future()
+        future.set_result(None)
+        return future
+
+    def list_forum_topics(self, chat_ref: str) -> list[dict]:
+        raise RuntimeError("Функция доступна только в процессе worker.")
 
 
 def normalize_times(raw_times: str) -> list[str]:
@@ -161,8 +190,13 @@ async def lifespan(app: FastAPI):
     log_queue: Queue[str] = Queue()
     logger = configure_logging(settings.log_path, log_queue)
 
-    telegram_service = TelegramService(settings, repository, logger)
-    telegram_service.start()
+    if settings.embedded_worker_enabled:
+        telegram_service = TelegramService(settings, repository, logger)
+        telegram_service.start()
+        logger.info("Worker запущен в embedded-режиме.")
+    else:
+        telegram_service = QueueOnlyTelegramService(repository)
+        logger.info("Worker отключен в web-процессе. Используется очередь публикаций.")
 
     app.state.settings = settings
     app.state.repository = repository

@@ -1,8 +1,9 @@
 import shutil
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 
 class Repository:
@@ -12,9 +13,12 @@ class Repository:
         self.media_dir.mkdir(exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA synchronous = NORMAL")
         return connection
 
     def init_db(self) -> None:
@@ -76,6 +80,56 @@ class Repository:
                     FOREIGN KEY (ad_id) REFERENCES ads(id) ON DELETE CASCADE,
                     FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE SET NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS publish_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ad_id INTEGER NOT NULL,
+                    run_type TEXT NOT NULL,
+                    slot_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    not_before TEXT NOT NULL,
+                    locked_at TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (ad_id) REFERENCES ads(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS publish_dedup (
+                    ad_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    slot_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (ad_id, target_id, slot_key),
+                    FOREIGN KEY (ad_id) REFERENCES ads(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS system_commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload TEXT,
+                    created_at TEXT NOT NULL,
+                    processed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_publish_log_published_at
+                    ON publish_log (published_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ad_targets_ad_target
+                    ON ad_targets (ad_id, target_id);
+                CREATE INDEX IF NOT EXISTS idx_schedules_ad_time
+                    ON schedules (ad_id, time_of_day);
+                CREATE INDEX IF NOT EXISTS idx_publish_jobs_status_not_before
+                    ON publish_jobs (status, not_before);
+                CREATE INDEX IF NOT EXISTS idx_publish_jobs_updated_at
+                    ON publish_jobs (updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_system_commands_status_id
+                    ON system_commands (status, id);
                 """
             )
             self._ensure_targets_columns(conn)
@@ -384,6 +438,178 @@ class Repository:
                 """,
                 (limit,),
             ).fetchall()
+
+    def enqueue_publish_job(
+        self,
+        ad_id: int,
+        run_type: str,
+        slot_key: str,
+        not_before: datetime | None = None,
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        not_before_value = (not_before or datetime.now()).isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO publish_jobs (ad_id, run_type, slot_key, status, not_before, created_at, updated_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (ad_id, run_type, slot_key, not_before_value, now, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def acquire_next_publish_job(self) -> dict[str, Any] | None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT id, ad_id, run_type, slot_key, attempts, max_attempts, not_before
+                FROM publish_jobs
+                WHERE status IN ('pending', 'retry')
+                  AND not_before <= ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if not row:
+                return None
+
+            updated = conn.execute(
+                """
+                UPDATE publish_jobs
+                SET status = 'running',
+                    locked_at = ?,
+                    started_at = COALESCE(started_at, ?),
+                    attempts = attempts + 1,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('pending', 'retry')
+                """,
+                (now, now, now, row["id"]),
+            )
+            if updated.rowcount == 0:
+                conn.commit()
+                return None
+
+            conn.commit()
+            return dict(row)
+
+    def complete_publish_job(self, job_id: int) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE publish_jobs
+                SET status = 'done', finished_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, job_id),
+            )
+            conn.commit()
+
+    def fail_publish_job(self, job_id: int, last_error: str, requeue: bool) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        next_status = "retry" if requeue else "failed"
+        next_attempt_at = datetime.now()
+        if requeue:
+            next_attempt_at = datetime.now() + timedelta(minutes=1)
+        next_attempt_at_value = next_attempt_at.isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE publish_jobs
+                SET status = ?,
+                    last_error = ?,
+                    not_before = CASE WHEN ? = 'retry' THEN ? ELSE not_before END,
+                    finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (next_status, last_error, next_status, next_attempt_at_value, next_status, now, now, job_id),
+            )
+            conn.commit()
+
+    def should_retry_publish_job(self, job_id: int) -> bool:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT attempts, max_attempts FROM publish_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return False
+            return int(row["attempts"]) < int(row["max_attempts"])
+
+    def reserve_publish_slot(self, ad_id: int, target_id: int, slot_key: str) -> bool:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO publish_dedup (ad_id, target_id, slot_key, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (ad_id, target_id, slot_key, now),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def enqueue_system_command(self, command: str, payload: str = "") -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO system_commands (command, payload, status, created_at)
+                VALUES (?, ?, 'pending', ?)
+                """,
+                (command, payload, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def acquire_next_system_command(self) -> dict[str, Any] | None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT id, command, payload
+                FROM system_commands
+                WHERE status = 'pending'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            updated = conn.execute(
+                """
+                UPDATE system_commands
+                SET status = 'processing'
+                WHERE id = ? AND status = 'pending'
+                """,
+                (row["id"],),
+            )
+            if updated.rowcount == 0:
+                conn.commit()
+                return None
+            conn.commit()
+            return dict(row)
+
+    def complete_system_command(self, command_id: int) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE system_commands
+                SET status = 'done', processed_at = ?
+                WHERE id = ?
+                """,
+                (now, command_id),
+            )
+            conn.commit()
 
     def _store_media_files(self, ad_id: int, media_sources: list[str]) -> list[str]:
         target_dir = self.media_dir / str(ad_id)
