@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import random
+import re
 import sqlite3
 import threading
 from concurrent.futures import Future
@@ -8,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, events, functions
 
 
 class TelegramService:
@@ -24,6 +26,8 @@ class TelegramService:
         self._job_loop_task: asyncio.Task | None = None
         self._command_loop_task: asyncio.Task | None = None
         self._running_lock = asyncio.Lock()
+        self._monitor_sources: list[dict] = []
+        self._monitor_rules: list[dict] = []
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -46,6 +50,7 @@ class TelegramService:
 
     def refresh_scheduler(self) -> None:
         self.repository.enqueue_system_command("reload_scheduler")
+        self.repository.enqueue_system_command("reload_monitoring")
         if not self._loop:
             return
         asyncio.run_coroutine_threadsafe(self._process_system_commands(), self._loop)
@@ -103,6 +108,8 @@ class TelegramService:
             self.logger.info("Аккаунт Telegram подключен.")
 
             self._scheduler = AsyncIOScheduler()
+            await self._reload_monitoring()
+            self._register_monitor_handlers()
             await self._reload_scheduler()
             self._scheduler.start()
             self._job_loop_task = self._loop.create_task(self._run_job_loop())
@@ -205,6 +212,10 @@ class TelegramService:
             try:
                 if command["command"] == "reload_scheduler":
                     await self._reload_scheduler()
+                if command["command"] == "reload_monitoring":
+                    await self._reload_monitoring()
+                if command["command"] == "run_monitor_test":
+                    await self._run_monitor_test(command.get("payload", ""))
             finally:
                 self.repository.complete_system_command(command["id"])
 
@@ -336,11 +347,319 @@ class TelegramService:
 
         return topics
 
+    async def _reload_monitoring(self) -> None:
+        self._monitor_sources = self.repository.list_active_monitoring_sources()
+        self._monitor_rules = self.repository.list_active_monitoring_rules()
+        self.logger.info(
+            "Мониторинг обновлен: источников=%s, правил=%s.",
+            len(self._monitor_sources),
+            len(self._monitor_rules),
+        )
+
+    def _register_monitor_handlers(self) -> None:
+        if not self._client:
+            return
+
+        @self._client.on(events.NewMessage(incoming=True))
+        async def monitor_incoming_message(event) -> None:
+            await self._handle_monitoring_event(event)
+
+    async def _handle_monitoring_event(self, event) -> None:
+        if not self._monitor_sources or not self._monitor_rules:
+            return
+
+        chat = await event.get_chat()
+        chat_id = str(event.chat_id or "")
+        username = getattr(chat, "username", None)
+        username_value = f"@{username.lower()}" if username else ""
+        source = self._find_monitor_source(chat_id, username_value)
+        if not source:
+            return
+
+        text = (event.raw_text or "").strip()
+        if not text and not event.photo:
+            return
+
+        has_photo = bool(event.photo or event.media)
+        detected_price = self._extract_price(text)
+        for rule in self._monitor_rules:
+            matched, matched_keywords = self._match_monitor_rule(
+                rule,
+                source["id"],
+                text,
+                detected_price,
+                has_photo,
+            )
+            if not matched:
+                continue
+
+            notification_sent = await self._notify_monitor_match(
+                source,
+                rule,
+                text,
+                detected_price,
+                has_photo,
+                matched_keywords,
+                chat_id,
+                event.id,
+            )
+            self.repository.add_monitor_match(
+                source_id=source["id"],
+                rule_id=rule["id"],
+                external_chat_id=chat_id,
+                external_message_id=int(event.id),
+                message_text=text[:4000],
+                detected_price=detected_price,
+                has_photo=has_photo,
+                matched_keywords=",".join(matched_keywords),
+                notified=notification_sent,
+            )
+
+    def _find_monitor_source(self, chat_id: str, username: str) -> dict | None:
+        for source in self._monitor_sources:
+            source_chat_ref = source["chat_ref"].strip().lower()
+            if source_chat_ref.startswith("https://t.me/"):
+                source_chat_ref = "@" + source_chat_ref.split("/")[-1]
+            if source_chat_ref == chat_id or (username and source_chat_ref == username):
+                return source
+        return None
+
+    def _extract_price(self, text: str) -> int | None:
+        if not text:
+            return None
+        lowered = text.lower()
+
+        # 1) Самый надежный сигнал - явная метка "цена/стоимость/за".
+        labeled_pattern = re.compile(
+            r"(?:цена|стоимость|продаю\s+за|отдам\s+за|за)\s*[:\-]?\s*"
+            r"(\d+(?:[ \.,]\d{3})*)\s*(тыс|к|k|млн|m|₸|тг|тенге)?",
+            re.IGNORECASE,
+        )
+        labeled_prices = [self._parse_price_candidate(m.group(1), m.group(2)) for m in labeled_pattern.finditer(lowered)]
+        labeled_prices = [value for value in labeled_prices if value is not None]
+        if labeled_prices:
+            return labeled_prices[-1]
+
+        # 2) Затем ищем число с явной валютой/суффиксом.
+        suffix_pattern = re.compile(
+            r"(?<![a-zа-я0-9])(\d+(?:[ \.,]\d{3})*)\s*(тыс|к|k|млн|m|₸|тг|тенге)\b",
+            re.IGNORECASE,
+        )
+        suffix_prices = [self._parse_price_candidate(m.group(1), m.group(2)) for m in suffix_pattern.finditer(lowered)]
+        suffix_prices = [value for value in suffix_prices if value is not None]
+        if suffix_prices:
+            return max(suffix_prices)
+
+        # 3) Числа вида 130.000 / 40 000 / 280,000 без явного слова "цена".
+        grouped_thousands_pattern = re.compile(
+            r"(?<![a-zа-я0-9])(\d{1,3}(?:[ \.,]\d{3})+)(?![a-zа-я0-9])",
+            re.IGNORECASE,
+        )
+        grouped_prices = [self._parse_price_candidate(m.group(1), None) for m in grouped_thousands_pattern.finditer(lowered)]
+        grouped_prices = [value for value in grouped_prices if value is not None]
+        if grouped_prices:
+            return max(grouped_prices)
+
+        # 4) Короткая цена (820) в контексте продажи/торга -> интерпретируем как 820 000.
+        short_sale_context_pattern = re.compile(
+            r"(?:продам|продаю|продается|отдам|лотом\s+по|без\s+торга|торг|срочно)\D{0,24}(\d{3,4})(?!\d)",
+            re.IGNORECASE,
+        )
+        short_context_prices = [
+            self._parse_price_candidate(m.group(1), None, assume_thousands=True)
+            for m in short_sale_context_pattern.finditer(lowered)
+        ]
+        short_context_prices = [value for value in short_context_prices if value is not None]
+        if short_context_prices:
+            return max(short_context_prices)
+
+        # 5) Фоллбек: только "похоже на цену" (5+ цифр), чтобы не ловить 10400F/1660 и т.д.
+        fallback_pattern = re.compile(r"(?<![a-zа-я0-9])(\d{5,})(?![a-zа-я0-9])", re.IGNORECASE)
+        fallback_prices = [self._parse_price_candidate(m.group(1), None) for m in fallback_pattern.finditer(lowered)]
+        fallback_prices = [value for value in fallback_prices if value is not None]
+        if fallback_prices:
+            return max(fallback_prices)
+
+        return None
+
+    def _parse_price_candidate(
+        self,
+        numeric_part: str,
+        suffix: str | None,
+        assume_thousands: bool = False,
+    ) -> int | None:
+        cleaned = numeric_part.replace(" ", "").replace(",", "").replace(".", "")
+        if not cleaned.isdigit():
+            return None
+
+        value = int(cleaned)
+        normalized_suffix = (suffix or "").strip().lower()
+        if normalized_suffix in {"тыс", "к", "k"}:
+            value *= 1000
+        elif normalized_suffix in {"млн", "m"}:
+            value *= 1_000_000
+        elif assume_thousands and 100 <= value < 10000:
+            value *= 1000
+
+        if value <= 0:
+            return None
+        return value
+
+    def _split_keywords(self, raw_keywords: str) -> list[str]:
+        return [item.strip().lower() for item in raw_keywords.split(",") if item.strip()]
+
+    def _match_monitor_rule(
+        self,
+        rule: dict,
+        source_id: int,
+        text: str,
+        price: int | None,
+        has_photo: bool,
+    ) -> tuple[bool, list[str]]:
+        source_ids = [int(value) for value in rule.get("source_ids", [])]
+        if source_ids and source_id not in source_ids:
+            return False, []
+
+        text_lc = text.lower()
+        include_keywords = self._split_keywords(rule.get("include_keywords", ""))
+        exclude_keywords = self._split_keywords(rule.get("exclude_keywords", ""))
+        matched_keywords = [keyword for keyword in include_keywords if keyword in text_lc]
+
+        if include_keywords and not matched_keywords:
+            return False, []
+        if any(keyword in text_lc for keyword in exclude_keywords):
+            return False, []
+        if int(rule.get("require_photo", 0)) and not has_photo:
+            return False, []
+
+        min_price = rule.get("min_price")
+        max_price = rule.get("max_price")
+        if price is not None:
+            if min_price is not None and price < int(min_price):
+                return False, []
+            if max_price is not None and price > int(max_price):
+                return False, []
+
+        return True, matched_keywords
+
+    async def _notify_monitor_match(
+        self,
+        source: dict,
+        rule: dict,
+        text: str,
+        price: int | None,
+        has_photo: bool,
+        matched_keywords: list[str],
+        external_chat_id: str,
+        external_message_id: int,
+    ) -> bool:
+        if not self._client:
+            return False
+
+        destination = (rule.get("notify_to") or "me").strip() or "me"
+        source_link = f"https://t.me/c/{str(external_chat_id).replace('-100', '')}/{external_message_id}"
+        message_lines = [
+            "Найдено новое объявление по правилу мониторинга.",
+            f"Источник: {source['name']} ({source['chat_ref']})",
+            f"Правило: {rule['name']}",
+            f"Цена: {price if price is not None else 'не определена'}",
+            f"Фото: {'да' if has_photo else 'нет'}",
+            f"Ключи: {', '.join(matched_keywords) if matched_keywords else 'нет'}",
+            f"Ссылка: {source_link}",
+            "",
+            text[:1500] if text else "(без текста)",
+        ]
+        try:
+            await self._client.send_message(destination, "\n".join(message_lines))
+            return True
+        except Exception as exc:
+            self.logger.exception("Не удалось отправить уведомление мониторинга: %s", exc)
+            return False
+
+    async def _run_monitor_test(self, payload: str) -> None:
+        if not self._client:
+            return
+        try:
+            parsed = json.loads(payload or "{}")
+            run_id = int(parsed.get("run_id", 0))
+        except Exception:
+            self.logger.error("Некорректный payload run_monitor_test: %s", payload)
+            return
+        if run_id <= 0:
+            return
+
+        run_payload = self.repository.get_monitor_test_payload(run_id)
+        if not run_payload:
+            self.repository.fail_monitor_test_run(run_id, "Тестовый запуск не найден.")
+            return
+
+        rule = run_payload["rule_payload"]
+        source_ids = [int(source_id) for source_id in run_payload["source_ids"]]
+        scan_limit = int(run_payload["scan_limit"])
+        sources = self.repository.list_monitor_sources_by_ids(source_ids)
+        if not sources:
+            self.repository.fail_monitor_test_run(run_id, "Не найдены источники для теста.")
+            return
+
+        self.repository.start_monitor_test_run(run_id)
+        total_scanned = 0
+        total_matches = 0
+        try:
+            for source in sources:
+                source_entity = self._resolve_chat_ref_for_telethon(str(source["chat_ref"]))
+                async for message in self._client.iter_messages(source_entity, limit=scan_limit):
+                    text = (message.raw_text or "").strip()
+                    has_photo = bool(message.photo or message.media)
+                    if not text and not has_photo:
+                        continue
+
+                    total_scanned += 1
+                    detected_price = self._extract_price(text)
+                    matched, matched_keywords = self._match_monitor_rule(
+                        rule=rule,
+                        source_id=int(source["id"]),
+                        text=text,
+                        price=detected_price,
+                        has_photo=has_photo,
+                    )
+                    if not matched:
+                        continue
+
+                    total_matches += 1
+                    self.repository.add_monitor_test_result(
+                        run_id=run_id,
+                        source_id=int(source["id"]),
+                        source_name=str(source["name"]),
+                        external_chat_id=str(message.chat_id or ""),
+                        external_message_id=int(message.id),
+                        message_text=text[:4000],
+                        detected_price=detected_price,
+                        has_photo=has_photo,
+                        matched_keywords=",".join(matched_keywords),
+                    )
+
+            self.repository.finish_monitor_test_run(run_id, total_scanned, total_matches)
+            self.logger.info(
+                "Тест мониторинга завершен: run_id=%s, checked=%s, matches=%s.",
+                run_id,
+                total_scanned,
+                total_matches,
+            )
+        except Exception as exc:
+            self.repository.fail_monitor_test_run(run_id, str(exc))
+            self.logger.exception("Ошибка теста мониторинга run_id=%s: %s", run_id, exc)
+
     def _resolve_media_path(self, relative_path: str) -> Path:
         media_path = Path(relative_path)
         if not media_path.is_absolute():
             media_path = self.settings.base_dir / media_path
         return media_path
+
+    def _resolve_chat_ref_for_telethon(self, chat_ref: str) -> int | str:
+        value = chat_ref.strip()
+        if value.startswith("-") and value[1:].isdigit():
+            return int(value)
+        return value
 
     def _is_session_locked_error(self, exc: Exception) -> bool:
         if isinstance(exc, sqlite3.OperationalError):

@@ -1,5 +1,6 @@
 import shutil
 import sqlite3
+import json
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -118,6 +119,82 @@ class Repository:
                     processed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS monitor_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    chat_ref TEXT NOT NULL UNIQUE,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    include_keywords TEXT NOT NULL DEFAULT '',
+                    exclude_keywords TEXT NOT NULL DEFAULT '',
+                    min_price INTEGER,
+                    max_price INTEGER,
+                    require_photo INTEGER NOT NULL DEFAULT 0,
+                    notify_to TEXT NOT NULL DEFAULT 'me',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_matches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER NOT NULL,
+                    rule_id INTEGER NOT NULL,
+                    external_chat_id TEXT NOT NULL,
+                    external_message_id INTEGER NOT NULL,
+                    message_text TEXT NOT NULL,
+                    detected_price INTEGER,
+                    has_photo INTEGER NOT NULL DEFAULT 0,
+                    matched_keywords TEXT NOT NULL DEFAULT '',
+                    notified INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (source_id) REFERENCES monitor_sources(id) ON DELETE CASCADE,
+                    FOREIGN KEY (rule_id) REFERENCES monitor_rules(id) ON DELETE CASCADE,
+                    UNIQUE(rule_id, external_chat_id, external_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_rule_sources (
+                    rule_id INTEGER NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    PRIMARY KEY (rule_id, source_id),
+                    FOREIGN KEY (rule_id) REFERENCES monitor_rules(id) ON DELETE CASCADE,
+                    FOREIGN KEY (source_id) REFERENCES monitor_sources(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_test_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    rule_payload TEXT NOT NULL,
+                    source_ids TEXT NOT NULL,
+                    scan_limit INTEGER NOT NULL,
+                    total_scanned INTEGER NOT NULL DEFAULT 0,
+                    total_matches INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS monitor_test_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    source_name TEXT NOT NULL,
+                    external_chat_id TEXT NOT NULL,
+                    external_message_id INTEGER NOT NULL,
+                    message_text TEXT NOT NULL,
+                    detected_price INTEGER,
+                    has_photo INTEGER NOT NULL DEFAULT 0,
+                    matched_keywords TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES monitor_test_runs(id) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_publish_log_published_at
                     ON publish_log (published_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_ad_targets_ad_target
@@ -130,6 +207,18 @@ class Repository:
                     ON publish_jobs (updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_system_commands_status_id
                     ON system_commands (status, id);
+                CREATE INDEX IF NOT EXISTS idx_monitor_sources_active
+                    ON monitor_sources (is_active, id);
+                CREATE INDEX IF NOT EXISTS idx_monitor_rules_active
+                    ON monitor_rules (is_active, id);
+                CREATE INDEX IF NOT EXISTS idx_monitor_matches_created
+                    ON monitor_matches (created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitor_rule_sources_rule
+                    ON monitor_rule_sources (rule_id, source_id);
+                CREATE INDEX IF NOT EXISTS idx_monitor_test_runs_status
+                    ON monitor_test_runs (status, id);
+                CREATE INDEX IF NOT EXISTS idx_monitor_test_results_run
+                    ON monitor_test_results (run_id, id);
                 """
             )
             self._ensure_targets_columns(conn)
@@ -610,6 +699,400 @@ class Repository:
                 (now, command_id),
             )
             conn.commit()
+
+    def list_monitor_sources(self) -> list[sqlite3.Row]:
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT id, name, chat_ref, is_active, created_at, updated_at
+                FROM monitor_sources
+                ORDER BY updated_at DESC, id DESC
+                """
+            ).fetchall()
+
+    def list_monitor_sources_by_ids(self, source_ids: list[int]) -> list[dict[str, Any]]:
+        if not source_ids:
+            return []
+        placeholders = ",".join("?" for _ in source_ids)
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, name, chat_ref, is_active
+                FROM monitor_sources
+                WHERE id IN ({placeholders})
+                ORDER BY id
+                """,
+                tuple(source_ids),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def save_monitor_source(
+        self,
+        source_id: int | None,
+        name: str,
+        chat_ref: str,
+        is_active: bool,
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            if source_id is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO monitor_sources (name, chat_ref, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, chat_ref, int(is_active), now, now),
+                )
+                conn.commit()
+                return int(cursor.lastrowid)
+
+            conn.execute(
+                """
+                UPDATE monitor_sources
+                SET name = ?, chat_ref = ?, is_active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, chat_ref, int(is_active), now, source_id),
+            )
+            conn.commit()
+            return source_id
+
+    def delete_monitor_source(self, source_id: int) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("DELETE FROM monitor_sources WHERE id = ?", (source_id,))
+            conn.commit()
+
+    def list_monitor_rules(self) -> list[sqlite3.Row]:
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT
+                    id, name, include_keywords, exclude_keywords, min_price, max_price,
+                    require_photo, notify_to, is_active, created_at, updated_at
+                FROM monitor_rules
+                ORDER BY updated_at DESC, id DESC
+                """
+            ).fetchall()
+
+    def save_monitor_rule(
+        self,
+        rule_id: int | None,
+        name: str,
+        include_keywords: str,
+        exclude_keywords: str,
+        min_price: int | None,
+        max_price: int | None,
+        require_photo: bool,
+        notify_to: str,
+        is_active: bool,
+        source_ids: list[int],
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            if rule_id is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO monitor_rules (
+                        name, include_keywords, exclude_keywords, min_price, max_price,
+                        require_photo, notify_to, is_active, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        include_keywords,
+                        exclude_keywords,
+                        min_price,
+                        max_price,
+                        int(require_photo),
+                        notify_to,
+                        int(is_active),
+                        now,
+                        now,
+                    ),
+                )
+                saved_rule_id = int(cursor.lastrowid)
+                self._replace_monitor_rule_sources(conn, saved_rule_id, source_ids)
+                conn.commit()
+                return saved_rule_id
+
+            conn.execute(
+                """
+                UPDATE monitor_rules
+                SET
+                    name = ?, include_keywords = ?, exclude_keywords = ?, min_price = ?, max_price = ?,
+                    require_photo = ?, notify_to = ?, is_active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    include_keywords,
+                    exclude_keywords,
+                    min_price,
+                    max_price,
+                    int(require_photo),
+                    notify_to,
+                    int(is_active),
+                    now,
+                    rule_id,
+                ),
+            )
+            self._replace_monitor_rule_sources(conn, rule_id, source_ids)
+            conn.commit()
+            return rule_id
+
+    def delete_monitor_rule(self, rule_id: int) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("DELETE FROM monitor_rules WHERE id = ?", (rule_id,))
+            conn.commit()
+
+    def list_monitor_matches(self, limit: int = 200) -> list[sqlite3.Row]:
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT
+                    mm.id, mm.created_at, mm.message_text, mm.detected_price, mm.has_photo, mm.matched_keywords,
+                    mm.notified, mm.external_chat_id, mm.external_message_id,
+                    ms.name AS source_name, ms.chat_ref AS source_chat_ref,
+                    mr.name AS rule_name
+                FROM monitor_matches mm
+                JOIN monitor_sources ms ON ms.id = mm.source_id
+                JOIN monitor_rules mr ON mr.id = mm.rule_id
+                ORDER BY mm.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    def list_active_monitoring_sources(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, chat_ref
+                FROM monitor_sources
+                WHERE is_active = 1
+                ORDER BY id
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_active_monitoring_rules(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    id, name, include_keywords, exclude_keywords, min_price, max_price,
+                    require_photo, notify_to
+                FROM monitor_rules
+                WHERE is_active = 1
+                ORDER BY id
+                """
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                rule_data = dict(row)
+                rule_data["source_ids"] = self._get_monitor_rule_sources_for_conn(conn, int(row["id"]))
+                result.append(rule_data)
+            return result
+
+    def get_monitor_rule_source_ids(self, rule_id: int) -> list[int]:
+        with closing(self.connect()) as conn:
+            return self._get_monitor_rule_sources_for_conn(conn, rule_id)
+
+    def add_monitor_match(
+        self,
+        source_id: int,
+        rule_id: int,
+        external_chat_id: str,
+        external_message_id: int,
+        message_text: str,
+        detected_price: int | None,
+        has_photo: bool,
+        matched_keywords: str,
+        notified: bool,
+    ) -> bool:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO monitor_matches (
+                        source_id, rule_id, external_chat_id, external_message_id, message_text,
+                        detected_price, has_photo, matched_keywords, notified, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_id,
+                        rule_id,
+                        external_chat_id,
+                        external_message_id,
+                        message_text,
+                        detected_price,
+                        int(has_photo),
+                        matched_keywords,
+                        int(notified),
+                        now,
+                    ),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def _replace_monitor_rule_sources(self, conn: sqlite3.Connection, rule_id: int, source_ids: list[int]) -> None:
+        conn.execute("DELETE FROM monitor_rule_sources WHERE rule_id = ?", (rule_id,))
+        for source_id in source_ids:
+            conn.execute(
+                "INSERT INTO monitor_rule_sources (rule_id, source_id) VALUES (?, ?)",
+                (rule_id, source_id),
+            )
+
+    def _get_monitor_rule_sources_for_conn(self, conn: sqlite3.Connection, rule_id: int) -> list[int]:
+        rows = conn.execute(
+            """
+            SELECT source_id
+            FROM monitor_rule_sources
+            WHERE rule_id = ?
+            ORDER BY source_id
+            """,
+            (rule_id,),
+        ).fetchall()
+        return [int(row["source_id"]) for row in rows]
+
+    def create_monitor_test_run(self, rule_payload: dict[str, Any], source_ids: list[int], scan_limit: int) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO monitor_test_runs (status, rule_payload, source_ids, scan_limit, created_at, updated_at)
+                VALUES ('pending', ?, ?, ?, ?, ?)
+                """,
+                (json.dumps(rule_payload, ensure_ascii=False), json.dumps(source_ids), scan_limit, now, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def start_monitor_test_run(self, run_id: int) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE monitor_test_runs
+                SET status = 'running', updated_at = ?, error_message = NULL, total_scanned = 0, total_matches = 0
+                WHERE id = ?
+                """,
+                (now, run_id),
+            )
+            conn.execute("DELETE FROM monitor_test_results WHERE run_id = ?", (run_id,))
+            conn.commit()
+
+    def add_monitor_test_result(
+        self,
+        run_id: int,
+        source_id: int,
+        source_name: str,
+        external_chat_id: str,
+        external_message_id: int,
+        message_text: str,
+        detected_price: int | None,
+        has_photo: bool,
+        matched_keywords: str,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO monitor_test_results (
+                    run_id, source_id, source_name, external_chat_id, external_message_id,
+                    message_text, detected_price, has_photo, matched_keywords, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    source_id,
+                    source_name,
+                    external_chat_id,
+                    external_message_id,
+                    message_text,
+                    detected_price,
+                    int(has_photo),
+                    matched_keywords,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def finish_monitor_test_run(self, run_id: int, total_scanned: int, total_matches: int) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE monitor_test_runs
+                SET status = 'done', total_scanned = ?, total_matches = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (total_scanned, total_matches, now, run_id),
+            )
+            conn.commit()
+
+    def fail_monitor_test_run(self, run_id: int, error_message: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE monitor_test_runs
+                SET status = 'failed', error_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (error_message, now, run_id),
+            )
+            conn.commit()
+
+    def get_monitor_test_run(self, run_id: int) -> sqlite3.Row | None:
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT id, status, scan_limit, total_scanned, total_matches, error_message, created_at, updated_at
+                FROM monitor_test_runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+    def get_monitor_test_payload(self, run_id: int) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT rule_payload, source_ids, scan_limit
+                FROM monitor_test_runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "rule_payload": json.loads(row["rule_payload"]),
+                "source_ids": json.loads(row["source_ids"]),
+                "scan_limit": int(row["scan_limit"]),
+            }
+
+    def list_monitor_test_results(self, run_id: int, limit: int = 200) -> list[sqlite3.Row]:
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT
+                    id, run_id, source_id, source_name, external_chat_id, external_message_id,
+                    message_text, detected_price, has_photo, matched_keywords, created_at
+                FROM monitor_test_results
+                WHERE run_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, limit),
+            ).fetchall()
 
     def _store_media_files(self, ad_id: int, media_sources: list[str]) -> list[str]:
         target_dir = self.media_dir / str(ad_id)

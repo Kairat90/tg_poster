@@ -1,4 +1,5 @@
 import shutil
+import json
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -34,6 +35,7 @@ class QueueOnlyTelegramService:
 
     def refresh_scheduler(self) -> None:
         self.repository.enqueue_system_command("reload_scheduler")
+        self.repository.enqueue_system_command("reload_monitoring")
 
     def publish_now(self, ad_id: int) -> Future:
         slot_key = f"manual:{ad_id}:{datetime.now().isoformat(timespec='seconds')}"
@@ -172,6 +174,88 @@ def serialize_log(row) -> dict:
     }
 
 
+def serialize_monitor_source(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "chat_ref": row["chat_ref"],
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def serialize_monitor_rule(row, source_ids: list[int]) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "include_keywords": row["include_keywords"],
+        "exclude_keywords": row["exclude_keywords"],
+        "min_price": row["min_price"],
+        "max_price": row["max_price"],
+        "require_photo": bool(row["require_photo"]),
+        "notify_to": row["notify_to"],
+        "source_ids": source_ids,
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def serialize_monitor_match(row) -> dict:
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "message_text": row["message_text"],
+        "detected_price": row["detected_price"],
+        "has_photo": bool(row["has_photo"]),
+        "matched_keywords": row["matched_keywords"],
+        "notified": bool(row["notified"]),
+        "external_chat_id": row["external_chat_id"],
+        "external_message_id": row["external_message_id"],
+        "source_name": row["source_name"],
+        "source_chat_ref": row["source_chat_ref"],
+        "rule_name": row["rule_name"],
+    }
+
+
+def serialize_monitor_test_run(row) -> dict:
+    if not row:
+        return {}
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "scan_limit": row["scan_limit"],
+        "total_scanned": row["total_scanned"],
+        "total_matches": row["total_matches"],
+        "error_message": row["error_message"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def serialize_monitor_test_result(row) -> dict:
+    external_chat_id = str(row["external_chat_id"] or "")
+    external_message_id = int(row["external_message_id"])
+    message_link = ""
+    if external_chat_id.startswith("-100") and len(external_chat_id) > 4:
+        message_link = f"https://t.me/c/{external_chat_id[4:]}/{external_message_id}"
+    return {
+        "id": row["id"],
+        "run_id": row["run_id"],
+        "source_id": row["source_id"],
+        "source_name": row["source_name"],
+        "external_chat_id": external_chat_id,
+        "external_message_id": external_message_id,
+        "message_link": message_link,
+        "message_text": row["message_text"],
+        "detected_price": row["detected_price"],
+        "has_photo": bool(row["has_photo"]),
+        "matched_keywords": row["matched_keywords"],
+        "created_at": row["created_at"],
+    }
+
+
 def api_error(message: str, status_code: int = 400) -> HTTPException:
     return HTTPException(status_code=status_code, detail=message)
 
@@ -255,11 +339,18 @@ async def api_status(request: Request) -> dict:
 @app.get("/api/bootstrap")
 async def api_bootstrap(request: Request) -> dict:
     repository = request.app.state.repository
+    monitor_rule_rows = repository.list_monitor_rules()
     return {
         "status": serialize_status(request)["status"],
         "ads": [serialize_ad_summary(row) for row in repository.list_ads()],
         "targets": [serialize_target(row) for row in repository.list_targets()],
         "logs": [serialize_log(row) for row in reversed(repository.list_publish_logs())],
+        "monitor_sources": [serialize_monitor_source(row) for row in repository.list_monitor_sources()],
+        "monitor_rules": [
+            serialize_monitor_rule(row, repository.get_monitor_rule_source_ids(int(row["id"])))
+            for row in monitor_rule_rows
+        ],
+        "monitor_matches": [serialize_monitor_match(row) for row in reversed(repository.list_monitor_matches())],
     }
 
 
@@ -454,6 +545,178 @@ async def api_logs(request: Request) -> dict:
 async def api_reload_scheduler(request: Request) -> dict:
     request.app.state.telegram_service.refresh_scheduler()
     return {"message": "Запрошено обновление расписания."}
+
+
+@app.get("/api/monitor/sources")
+async def api_list_monitor_sources(request: Request) -> dict:
+    repository = request.app.state.repository
+    return {"items": [serialize_monitor_source(row) for row in repository.list_monitor_sources()]}
+
+
+@app.post("/api/monitor/sources")
+async def api_save_monitor_source(
+    request: Request,
+    name: str = Form(...),
+    chat_ref: str = Form(...),
+    is_active: str = Form(default="true"),
+    source_id: int | None = Form(default=None),
+) -> dict:
+    repository = request.app.state.repository
+    telegram_service = request.app.state.telegram_service
+    name = name.strip()
+    chat_ref = chat_ref.strip()
+    if not name or not chat_ref:
+        raise api_error("Укажите название источника и chat_ref.")
+    saved_id = repository.save_monitor_source(source_id, name, chat_ref, is_active.lower() in {"true", "1", "on", "yes"})
+    telegram_service.refresh_scheduler()
+    saved = next((row for row in repository.list_monitor_sources() if row["id"] == saved_id), None)
+    if not saved:
+        raise api_error("Не удалось получить сохраненный источник.", 500)
+    return {"message": "Источник мониторинга сохранен.", "item": serialize_monitor_source(saved)}
+
+
+@app.delete("/api/monitor/sources/{source_id}")
+async def api_delete_monitor_source(request: Request, source_id: int) -> dict:
+    repository = request.app.state.repository
+    telegram_service = request.app.state.telegram_service
+    repository.delete_monitor_source(source_id)
+    telegram_service.refresh_scheduler()
+    return {"message": "Источник мониторинга удален."}
+
+
+@app.get("/api/monitor/rules")
+async def api_list_monitor_rules(request: Request) -> dict:
+    repository = request.app.state.repository
+    rows = repository.list_monitor_rules()
+    items = [
+        serialize_monitor_rule(row, repository.get_monitor_rule_source_ids(int(row["id"])))
+        for row in rows
+    ]
+    return {"items": items}
+
+
+@app.post("/api/monitor/rules")
+async def api_save_monitor_rule(
+    request: Request,
+    name: str = Form(...),
+    include_keywords: str = Form(default=""),
+    exclude_keywords: str = Form(default=""),
+    min_price: str = Form(default=""),
+    max_price: str = Form(default=""),
+    require_photo: str = Form(default="false"),
+    notify_to: str = Form(default="me"),
+    is_active: str = Form(default="true"),
+    source_ids: list[int] = Form(default=[]),
+    rule_id: int | None = Form(default=None),
+) -> dict:
+    repository = request.app.state.repository
+    telegram_service = request.app.state.telegram_service
+    name = name.strip()
+    if not name:
+        raise api_error("Укажите название правила.")
+
+    min_price_value = int(min_price) if min_price.strip() else None
+    max_price_value = int(max_price) if max_price.strip() else None
+    if min_price_value is not None and max_price_value is not None and min_price_value > max_price_value:
+        raise api_error("Минимальная цена не может быть больше максимальной.")
+    if not source_ids:
+        raise api_error("Выберите хотя бы один источник для правила.")
+
+    saved_id = repository.save_monitor_rule(
+        rule_id=rule_id,
+        name=name,
+        include_keywords=include_keywords.strip(),
+        exclude_keywords=exclude_keywords.strip(),
+        min_price=min_price_value,
+        max_price=max_price_value,
+        require_photo=require_photo.lower() in {"true", "1", "on", "yes"},
+        notify_to=notify_to.strip() or "me",
+        is_active=is_active.lower() in {"true", "1", "on", "yes"},
+        source_ids=source_ids,
+    )
+    telegram_service.refresh_scheduler()
+    saved = next((row for row in repository.list_monitor_rules() if row["id"] == saved_id), None)
+    if not saved:
+        raise api_error("Не удалось получить сохраненное правило.", 500)
+    saved_source_ids = repository.get_monitor_rule_source_ids(int(saved["id"]))
+    return {"message": "Правило мониторинга сохранено.", "item": serialize_monitor_rule(saved, saved_source_ids)}
+
+
+@app.delete("/api/monitor/rules/{rule_id}")
+async def api_delete_monitor_rule(request: Request, rule_id: int) -> dict:
+    repository = request.app.state.repository
+    telegram_service = request.app.state.telegram_service
+    repository.delete_monitor_rule(rule_id)
+    telegram_service.refresh_scheduler()
+    return {"message": "Правило мониторинга удалено."}
+
+
+@app.get("/api/monitor/matches")
+async def api_list_monitor_matches(request: Request) -> dict:
+    repository = request.app.state.repository
+    return {"items": [serialize_monitor_match(row) for row in reversed(repository.list_monitor_matches())]}
+
+
+@app.post("/api/monitor/test-rule")
+async def api_monitor_test_rule(
+    request: Request,
+    name: str = Form(...),
+    include_keywords: str = Form(default=""),
+    exclude_keywords: str = Form(default=""),
+    min_price: str = Form(default=""),
+    max_price: str = Form(default=""),
+    require_photo: str = Form(default="false"),
+    source_ids: list[int] = Form(default=[]),
+    scan_limit: str = Form(default="50"),
+) -> dict:
+    repository = request.app.state.repository
+
+    name = name.strip()
+    if not name:
+        raise api_error("Укажите название правила для теста.")
+    if not source_ids:
+        raise api_error("Выберите хотя бы один источник для теста.")
+
+    try:
+        scan_limit_value = int(scan_limit)
+    except ValueError as exc:
+        raise api_error("Лимит должен быть целым числом.") from exc
+    if scan_limit_value < 1 or scan_limit_value > 100:
+        raise api_error("Лимит сообщений должен быть в диапазоне 1..100.")
+
+    min_price_value = int(min_price) if min_price.strip() else None
+    max_price_value = int(max_price) if max_price.strip() else None
+    if min_price_value is not None and max_price_value is not None and min_price_value > max_price_value:
+        raise api_error("Минимальная цена не может быть больше максимальной.")
+
+    rule_payload = {
+        "name": name,
+        "include_keywords": include_keywords.strip(),
+        "exclude_keywords": exclude_keywords.strip(),
+        "min_price": min_price_value,
+        "max_price": max_price_value,
+        "require_photo": require_photo.lower() in {"true", "1", "on", "yes"},
+        "source_ids": source_ids,
+    }
+    run_id = repository.create_monitor_test_run(rule_payload, source_ids, scan_limit_value)
+    repository.enqueue_system_command(
+        "run_monitor_test",
+        json.dumps({"run_id": run_id}, ensure_ascii=False),
+    )
+    return {"message": "Тест правила запущен.", "run_id": run_id}
+
+
+@app.get("/api/monitor/test-rule/{run_id}")
+async def api_monitor_test_rule_status(request: Request, run_id: int) -> dict:
+    repository = request.app.state.repository
+    run = repository.get_monitor_test_run(run_id)
+    if not run:
+        raise api_error("Тестовый запуск не найден.", 404)
+    results = repository.list_monitor_test_results(run_id)
+    return {
+        "run": serialize_monitor_test_run(run),
+        "items": [serialize_monitor_test_result(row) for row in reversed(results)],
+    }
 
 
 @app.get("/ads")
